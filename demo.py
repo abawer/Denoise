@@ -1,106 +1,140 @@
-import torch, torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import matplotlib.pyplot as plt
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# ------------------------------------------------------
+# 1. Synthetic Dataset: sin(x)
+# ------------------------------------------------------
 torch.manual_seed(42)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ------------------------------------------------------------------
-# 1.  Data (same as before)
-# ------------------------------------------------------------------
-n, d_in, d_hidden, d_out = 1000, 10, 64, 1
-X = torch.randn(n, d_in, device=device)
-true_mlp = torch.nn.Sequential(
-    torch.nn.Linear(d_in, d_hidden),
-    torch.nn.Tanh(),
-    torch.nn.Linear(d_hidden, d_out)
-).to(device)
+def generate_data(n=512):
+    x = torch.linspace(-np.pi, np.pi, n).unsqueeze(1)
+    y = torch.sin(x)
+    return x.to(device), y.to(device)
+
+X_train, Y_train = generate_data()
+
+# ------------------------------------------------------
+# 2. Simple MLP definition with Xavier init
+# ------------------------------------------------------
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for layer in [self.fc1, self.fc2, self.fc3]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x):
+        x = torch.sigmoid(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))
+        return self.fc3(x)
+
+# ------------------------------------------------------
+# 3. Flatten & inject weights
+# ------------------------------------------------------
+def get_weights(model):
+    return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+# ------------------------------------------------------
+# 4. Loss Function
+# ------------------------------------------------------
+def compute_loss(pred, y):
+    return F.mse_loss(pred, y)
+
+# ------------------------------------------------------
+# 5. Initialization
+# ------------------------------------------------------
+model = MLP().to(device)
+W = get_weights(model)
+W_dim = W.numel()
+latent_dim = 20
+
+print(W_dim, latent_dim)
+
+R = (torch.randn(W_dim, latent_dim, device=device) / latent_dim**0.5)
+N = nn.Parameter(torch.zeros(latent_dim, device=device))  # Make N a learnable parameter
+
+# ------------------------------------------------------
+# 6. Latent Optimization Loop with Backpropagation (FIXED)
+# ------------------------------------------------------
+lr_N = 0.01
+n_iter = 5000
+losses = []
+
+optimizer = torch.optim.Adam([N], lr=lr_N)
+
+# Extract parameter shapes for reconstruction
+shapes = [p.data.shape for p in model.parameters()]
+sizes = [p.numel() for p in model.parameters()]
+
+for i in range(n_iter + 1):
+    # Compute current weights
+    W_current = W - R @ N
+    
+    # Reconstruct parameters from flat vector
+    params = []
+    start = 0
+    for size, shape in zip(sizes, shapes):
+        param = W_current[start:start+size].view(shape)
+        params.append(param)
+        start += size
+    
+    # Functional forward pass (preserves gradient flow)
+    x = X_train
+    x = torch.sigmoid(F.linear(x, params[0], params[1]))
+    x = torch.sigmoid(F.linear(x, params[2], params[3]))
+    pred = F.linear(x, params[4], params[5])
+    
+    # Compute loss
+    loss = compute_loss(pred, Y_train)
+    
+    # Backpropagation
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    if i % 100 == 0:
+        print(f"Iter {i:4d} | Loss: {loss.item():.5f} | ||N||: {N.data.norm().item():.4f}")
+    
+    losses.append(loss.item())
+
+# ------------------------------------------------------
+# 7. Visualize Final Result
+# ------------------------------------------------------
+# Recreate final model with learned weights
+model_final = MLP().to(device)
 with torch.no_grad():
-    Y = true_mlp(X)
-loader = DataLoader(TensorDataset(X, Y), batch_size=256, shuffle=True)
+    W_final = W - R @ N
+    start = 0
+    for i, p in enumerate(model_final.parameters()):
+        size = p.numel()
+        p.copy_(W_final[start:start+size].view_as(p))
+        start += size
 
-# ------------------------------------------------------------------
-# 2.  True / noisy weights
-# ------------------------------------------------------------------
-true_params = [p.detach().clone() for p in true_mlp.parameters()]
-noise_std = 0.5
-noisy_params = [p + torch.randn_like(p) * noise_std for p in true_params]
-
-# ------------------------------------------------------------------
-# 3.  Low-rank linear noise model
-# ------------------------------------------------------------------
-latent_dim = 200
-proj_mats, z_vecs = [], []
-for p in noisy_params:
-    flat = p.numel()
-    # fixed random basis
-    R = torch.randn(flat, latent_dim, device=device) / (latent_dim ** 0.5)
-    proj_mats.append(R)
-    # learnable latent vector
-    z = torch.zeros(latent_dim, 1, device=device, requires_grad=True)
-    z_vecs.append(z)
-
-# ------------------------------------------------------------------
-# 4.  Forward helper
-# ------------------------------------------------------------------
-def forward(x):
-    params = [p - (R @ z).view_as(p)
-              for p, R, z in zip(noisy_params, proj_mats, z_vecs)]
-    w1, b1, w2, b2 = params
-    h = torch.tanh(F.linear(x, w1, b1))
-    return F.linear(h, w2, b2)
-
-# ------------------------------------------------------------------
-# 5.  Optimise latent vectors (linear in z, non-linear network)
-# ------------------------------------------------------------------
-opt = torch.optim.Adam(z_vecs, lr=1e-2)
-
-for epoch in range(3000):
-    for xb, yb in loader:
-        opt.zero_grad()
-        loss = F.mse_loss(forward(xb), yb)
-        loss.backward()
-        opt.step()
-    if epoch % 50 == 0:
-        with torch.no_grad():
-            full_loss = F.mse_loss(forward(X), Y).item()
-        print(f'Epoch {epoch:3d}  loss={full_loss:.6f}')
-
-###############################################################################
-# 6.  Evaluation & plots  (clean)
-###############################################################################
-# 6-a  Save the learned latent vectors
-learned_z = [z.clone() for z in z_vecs]
-
-# 6-b  Create the noisy model (z = 0)
 with torch.no_grad():
-    for z in z_vecs:
-        z.zero_()
-    y_noisy = forward(X)
+    pred = model_final(X_train)
 
-# 6-c  Restore learned z for the denoised model
-with torch.no_grad():
-    for z, lz in zip(z_vecs, learned_z):
-        z.copy_(lz)
-    y_clean = forward(X)
+plt.figure(figsize=(8, 4))
+plt.plot(X_train.cpu(), Y_train.cpu(), label="Target", linewidth=2)
+plt.plot(X_train.cpu(), pred.cpu(), label="Predicted", linewidth=2)
+plt.legend()
+plt.title("Final Model after Latent Optimization (Backprop)")
+plt.grid()
+plt.show()
 
-# 6-d  Report MSEs
-print(f'Noisy  MSE:   {F.mse_loss(y_noisy, Y).item():.5f}')
-print(f'Denoised MSE: {F.mse_loss(y_clean, Y).item():.5f}')
-
-# 6-e  Plot
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 3, 1)
-plt.scatter(X[:, 0].cpu(), Y.squeeze().cpu(), s=10)
-plt.title('True Data')
-
-plt.subplot(1, 3, 2)
-plt.scatter(X[:, 0].cpu(), y_noisy.squeeze().cpu(), s=10, color='r')
-plt.title('Noisy Model (z = 0)')
-
-plt.subplot(1, 3, 3)
-plt.scatter(X[:, 0].cpu(), y_clean.squeeze().cpu(), s=10, color='g')
-plt.title('Denoised Model (learned z)')
-
-plt.tight_layout()
+plt.figure()
+plt.plot(losses)
+plt.title("Loss (Backprop) over Iterations")
+plt.xlabel("Iteration")
+plt.ylabel("Loss")
+plt.grid()
 plt.show()
