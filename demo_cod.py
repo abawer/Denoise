@@ -39,10 +39,9 @@ def get_weights(model):
     return torch.cat([p.data.view(-1) for p in model.parameters()])
 
 # ------------------------------------------------------
-# 2. Gradient-Only Optimization (New)
+# 2. Stable Latent Optimization
 # ------------------------------------------------------
 def reconstruct_weights(W0, R, N, shapes, sizes):
-    """Convert flat W0 - R@N back to layer weights"""
     W = W0 - R @ N
     params = []
     start = 0
@@ -51,60 +50,74 @@ def reconstruct_weights(W0, R, N, shapes, sizes):
         start += size
     return params
 
-def gradient_only_train(model, X, Y, latent_dim=20, n_iter=1000):
-    # Initialize fixed components
+
+def latent_coordinate_descent(model, X, Y, latent_dim=16, n_iter=5000, step=1e-5, lr=0.01, momentum=0.95):
     W0 = get_weights(model)
     shapes = [p.shape for p in model.parameters()]
     sizes = [p.numel() for p in model.parameters()]
-    R = torch.randn(W0.numel(), latent_dim, device=device) / np.sqrt(latent_dim)
+    d = W0.numel()
+
+    R = torch.randn(d, latent_dim, device=W0.device) * latent_dim ** -0.5
+    N = torch.zeros(latent_dim, device=W0.device)
     
-    # Optimization state
-    N = torch.zeros(latent_dim, device=device)
-    lr = 0.1
-    momentum = 0.9
-    velocity = torch.zeros_like(N)
-    h = 1e-5  # Finite difference step
+    velocity = torch.zeros_like(N)  # momentum accumulator
+
     losses = []
-    
-    for i in range(n_iter):
-        # Current loss
+
+    for i in range(n_iter+1):
+        coord = i % latent_dim  # cyclic coordinate
+        
+        # Evaluate loss at N+step and N-step on this coordinate
+        for delta in [+step, -step]:
+            N_temp = N.clone()
+            N_temp[coord] += delta
+            params = reconstruct_weights(W0, R, N_temp, shapes, sizes)
+            with torch.no_grad():
+                pred = model_forward(X, params)
+                loss = F.mse_loss(pred, Y).item()
+            if delta == +step:
+                loss_plus = loss
+            else:
+                loss_minus = loss
+        
+        # Approximate gradient for this coordinate
+        grad_approx = (loss_plus - loss_minus) / (2 * step)
+        
+        # Update velocity with momentum
+        velocity[coord] = momentum * velocity[coord] - lr * grad_approx
+        
+        # Update latent vector with velocity
+        N = N + velocity
+
+        # Track loss at current N
         params = reconstruct_weights(W0, R, N, shapes, sizes)
         with torch.no_grad():
-            x = torch.sigmoid(F.linear(X, params[0], params[1]))
-            x = torch.sigmoid(F.linear(x, params[2], params[3]))
-            pred = F.linear(x, params[4], params[5])
-            current_loss = F.mse_loss(pred, Y).item()
-        losses.append(current_loss)
-        
-        # Finite-difference gradient
-        grad = torch.zeros_like(N)
-        for j in range(latent_dim):
-            N_perturbed = N.clone()
-            N_perturbed[j] += h
-            params = reconstruct_weights(W0, R, N_perturbed, shapes, sizes)
-            with torch.no_grad():
-                x = torch.sigmoid(F.linear(X, params[0], params[1]))
-                x = torch.sigmoid(F.linear(x, params[2], params[3]))
-                pred = F.linear(x, params[4], params[5])
-                perturbed_loss = F.mse_loss(pred, Y).item()
-            grad[j] = (perturbed_loss - current_loss) / h
-        
-        # Update with momentum
-        velocity = momentum * velocity + (1 - momentum) * grad
-        N -= lr * velocity
-        
-        if i % 30 == 0:
-            print(f"Iter {i:4d} | Loss: {current_loss:.5f}")
-    
+            pred = model_forward(X, params)
+            loss_now = F.mse_loss(pred, Y).item()
+        losses.append(loss_now)
+
+        if i % 100 == 0:
+            print(f"Iter {i:4d} | Loss: {loss_now:.5f}")
+
     return N, R, losses
 
+
+def model_forward(X, params):
+    # params: list of weight and bias tensors ordered like your model
+    # Example for a 3-layer MLP with sigmoid activations:
+    x = torch.sigmoid(F.linear(X, params[0], params[1]))
+    x = torch.sigmoid(F.linear(x, params[2], params[3]))
+    pred = F.linear(x, params[4], params[5])
+    return pred
+
+
 # ------------------------------------------------------
-# 3. Training & Visualization (Modified)
+# 3. Train and Visualize
 # ------------------------------------------------------
 model = MLP().to(device)
-N_optimal, R_optimal, losses = gradient_only_train(model, X_train, Y_train)
+N_optimal, R_optimal, losses = latent_coordinate_descent(model, X_train, Y_train)
 
-# Reconstruct final model
+# Final model reconstruction
 with torch.no_grad():
     W_final = get_weights(model) - R_optimal @ N_optimal
     start = 0
