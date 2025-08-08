@@ -12,7 +12,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def generate_data(n=512):
     x = torch.linspace(-np.pi, np.pi, n).unsqueeze(1)
-    y = torch.sin(x)
+    y = torch.cos(x)
     return x.to(device), y.to(device)
 
 X_train, Y_train = generate_data()
@@ -39,7 +39,7 @@ def get_weights(model):
     return torch.cat([p.data.view(-1) for p in model.parameters()])
 
 # ------------------------------------------------------
-# 2. Stable Latent Optimization
+# 2. Weight reconstruction helper (unchanged)
 # ------------------------------------------------------
 def reconstruct_weights(W0, R, N, shapes, sizes):
     W = W0 - R @ N
@@ -50,8 +50,19 @@ def reconstruct_weights(W0, R, N, shapes, sizes):
         start += size
     return params
 
+# ------------------------------------------------------
+# 3. Model forward with given parameters (unchanged)
+# ------------------------------------------------------
+def model_forward(X, params):
+    x = torch.sigmoid(F.linear(X, params[0], params[1]))
+    x = torch.sigmoid(F.linear(x, params[2], params[3]))
+    pred = F.linear(x, params[4], params[5])
+    return pred
 
-def latent_coordinate_descent(model, X, Y, latent_dim=16, n_iter=5000, step=1e-5, lr=0.01, momentum=0.95):
+# ------------------------------------------------------
+# 4. Random Direction Gradient Estimation optimizer
+# ------------------------------------------------------
+def latent_coordinate_descent(model, X, Y, latent_dim=32, n_iter=5000, step=1e-5, lr=0.1, momentum=0.95):
     W0 = get_weights(model)
     shapes = [p.shape for p in model.parameters()]
     sizes = [p.numel() for p in model.parameters()]
@@ -59,34 +70,36 @@ def latent_coordinate_descent(model, X, Y, latent_dim=16, n_iter=5000, step=1e-5
 
     R = torch.randn(d, latent_dim, device=W0.device) * latent_dim ** -0.5
     N = torch.zeros(latent_dim, device=W0.device)
-    
     velocity = torch.zeros_like(N)  # momentum accumulator
 
     losses = []
 
-    for i in range(n_iter+1):
-        coord = i % latent_dim  # cyclic coordinate
-        
-        # Evaluate loss at N+step and N-step on this coordinate
-        for delta in [+step, -step]:
-            N_temp = N.clone()
-            N_temp[coord] += delta
-            params = reconstruct_weights(W0, R, N_temp, shapes, sizes)
+    k = int(latent_dim**0.5)  # number of random directions to average over
+    h = step
+
+    for i in range(n_iter + 1):
+        grad_estimate = torch.zeros_like(N)
+
+        for _ in range(k):
+            u = torch.randn(latent_dim, device=N.device)
+            u /= torch.norm(u) + 1e-8  # normalize
+
+            N_plus = N + h * u
+            N_minus = N - h * u
+
+            params_plus = reconstruct_weights(W0, R, N_plus, shapes, sizes)
+            params_minus = reconstruct_weights(W0, R, N_minus, shapes, sizes)
+
             with torch.no_grad():
-                pred = model_forward(X, params)
-                loss = F.mse_loss(pred, Y).item()
-            if delta == +step:
-                loss_plus = loss
-            else:
-                loss_minus = loss
-        
-        # Approximate gradient for this coordinate
-        grad_approx = (loss_plus - loss_minus) / (2 * step)
-        
-        # Update velocity with momentum
-        velocity[coord] = momentum * velocity[coord] - lr * grad_approx
-        
-        # Update latent vector with velocity
+                loss_plus = F.mse_loss(model_forward(X, params_plus), Y).item()
+                loss_minus = F.mse_loss(model_forward(X, params_minus), Y).item()
+
+            grad_estimate += ((loss_plus - loss_minus) / (2 * h)) * u
+
+        grad_estimate /= k  # average
+
+        # Momentum update
+        velocity = momentum * velocity - lr * grad_estimate
         N = N + velocity
 
         # Track loss at current N
@@ -102,17 +115,8 @@ def latent_coordinate_descent(model, X, Y, latent_dim=16, n_iter=5000, step=1e-5
     return N, R, losses
 
 
-def model_forward(X, params):
-    # params: list of weight and bias tensors ordered like your model
-    # Example for a 3-layer MLP with sigmoid activations:
-    x = torch.sigmoid(F.linear(X, params[0], params[1]))
-    x = torch.sigmoid(F.linear(x, params[2], params[3]))
-    pred = F.linear(x, params[4], params[5])
-    return pred
-
-
 # ------------------------------------------------------
-# 3. Train and Visualize
+# 5. Train and visualize
 # ------------------------------------------------------
 model = MLP().to(device)
 N_optimal, R_optimal, losses = latent_coordinate_descent(model, X_train, Y_train)
